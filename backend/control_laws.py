@@ -5,7 +5,12 @@ Cada controlador es una clase con .step(y, dt) -> u  (señal de control),
 donde y es la variable controlada medida. Con el ESP32 real, estas leyes
 viven en el firmware; aquí replican el comportamiento para poder probar todo
 sin hardware.
+
+Controladores: PID, Fuzzy (difusa), LQR y SMC (modos deslizantes).
+LQR y SMC son basados en modelo: usan el modelo de 2do orden de la planta.
 """
+
+DT = 0.03  # periodo de muestreo (s), coherente con source.py
 
 
 class PID:
@@ -20,26 +25,7 @@ class PID:
         self._int += e * dt
         de = 0.0 if self._prev_e is None else (e - self._prev_e) / dt
         self._prev_e = e
-        u = self.kp * e + self.ki * self._int + self.kd * de
-        return u
-
-
-class OnOff:
-    """Control lógico on-off con histéresis."""
-    def __init__(self, setpoint, histeresis, u_alta, u_baja):
-        self.sp = setpoint
-        self.h = histeresis
-        self.u_alta, self.u_baja = u_alta, u_baja
-        self._u = u_baja
-
-    def step(self, y, dt):
-        e = self.sp - y
-        if e > self.h:
-            self._u = self.u_alta
-        elif e < -self.h:
-            self._u = self.u_baja
-        # dentro de la banda: mantiene la última salida
-        return self._u
+        return self.kp * e + self.ki * self._int + self.kd * de
 
 
 class Fuzzy:
@@ -61,7 +47,6 @@ class Fuzzy:
 
     @staticmethod
     def _memberships(x):
-        # x normalizado (~[-1,1]) -> grados de N, Z, P
         x = max(-1.0, min(1.0, x))
         neg = max(0.0, -x)
         pos = max(0.0, x)
@@ -87,56 +72,112 @@ class Fuzzy:
         return out * self.ku
 
 
-class MPC:
+class LQR:
     """
-    Control predictivo por modelo (simplificado, SISO).
-    Usa el modelo interno de la planta para predecir Np pasos y elige la señal
-    de control constante que minimiza el error futuro con penalización lambda
-    al esfuerzo. Optimización escalar por barrido.
-    """
-    def __init__(self, setpoint, np_, nc, lam, model):
-        self.sp = setpoint
-        self.np = int(max(1, np_))
-        self.nc = int(max(1, nc))
-        self.lam = lam
-        self.model = model  # dict con K, wn, z
-        self._x = [0.0, 0.0]  # estado interno estimado [y, y']
+    Regulador lineal cuadrático (realimentación de estado óptima).
 
-    def _predict(self, x, u, dt):
-        K, wn, z = self.model["K"], self.model["wn"], self.model["z"]
-        y, yd = x
-        ydd = K * wn * wn * u - 2 * z * wn * yd - wn * wn * y
-        yd2 = yd + ydd * dt
-        y2 = y + yd * dt
-        return [y2, yd2]
+    Estado x = [posición, velocidad]. La ganancia K se obtiene resolviendo la
+    ecuación de Riccati discreta (DARE) a partir del modelo de la planta y de
+    los pesos Q = diag(q_pos, q_vel) y R. Se agrega un término de
+    prealimentación para llevar el estado estacionario al setpoint.
+
+        u = ff*sp + k1*(sp - y) - k2*vel
+    """
+    def __init__(self, setpoint, q_pos, q_vel, r, planta):
+        self.sp = setpoint
+        K, wn, z = planta["K"], planta["wn"], planta["z"]
+        a0 = wn * wn          # rigidez
+        a1 = 2 * z * wn       # amortiguamiento
+        b = K * wn * wn       # ganancia de entrada
+        dt = DT
+        # discretización Euler del modelo continuo
+        Ad = [[1.0, dt], [-a0 * dt, 1.0 - a1 * dt]]
+        Bd = [0.0, b * dt]
+        Q = [[max(q_pos, 0.0), 0.0], [0.0, max(q_vel, 0.0)]]
+        R = max(r, 1e-3)
+        self.k1, self.k2 = self._dlqr(Ad, Bd, Q, R)
+        self.ff = a0 / b if b != 0 else 0.0     # prealimentación (u para sostener sp)
+        self._prev_y = None
+
+    @staticmethod
+    def _matT(A):
+        return [[A[0][0], A[1][0]], [A[0][1], A[1][1]]]
+
+    @staticmethod
+    def _mul(A, B):
+        return [[sum(A[i][k] * B[k][j] for k in range(2)) for j in range(2)] for i in range(2)]
+
+    def _dlqr(self, Ad, Bd, Q, R):
+        # Itera la DARE hasta converger (2x2, una sola entrada).
+        P = [[0.0, 0.0], [0.0, 0.0]]
+        AdT = self._matT(Ad)
+        for _ in range(1000):
+            AdTP = self._mul(AdT, P)
+            AdTPA = self._mul(AdTP, Ad)
+            # Ad^T P Bd  (2x1)
+            AtPB = [AdTP[0][0] * Bd[0] + AdTP[0][1] * Bd[1],
+                    AdTP[1][0] * Bd[0] + AdTP[1][1] * Bd[1]]
+            # Bd^T P Bd  (escalar)
+            BtPB = Bd[0] * (P[0][0] * Bd[0] + P[0][1] * Bd[1]) + \
+                   Bd[1] * (P[1][0] * Bd[0] + P[1][1] * Bd[1])
+            S = R + BtPB
+            Pn = [[Q[i][j] + AdTPA[i][j] - AtPB[i] * AtPB[j] / S for j in range(2)] for i in range(2)]
+            diff = max(abs(Pn[i][j] - P[i][j]) for i in range(2) for j in range(2))
+            P = Pn
+            if diff < 1e-9:
+                break
+        # K = (1/S) Bd^T P Ad
+        BtP = [P[0][0] * Bd[0] + P[1][0] * Bd[1], P[0][1] * Bd[0] + P[1][1] * Bd[1]]
+        BtPB = Bd[0] * (P[0][0] * Bd[0] + P[0][1] * Bd[1]) + \
+               Bd[1] * (P[1][0] * Bd[0] + P[1][1] * Bd[1])
+        S = R + BtPB
+        k1 = (BtP[0] * Ad[0][0] + BtP[1] * Ad[1][0]) / S
+        k2 = (BtP[0] * Ad[0][1] + BtP[1] * Ad[1][1]) / S
+        return k1, k2
 
     def step(self, y, dt):
-        # sincroniza estimación de posición con la medición
-        self._x[0] = y
-        best_u, best_J = 0.0, float("inf")
-        for k in range(-40, 41):
-            u = k * 2.5
-            x = list(self._x)
-            J = 0.0
-            for _ in range(self.np):
-                x = self._predict(x, u, dt)
-                J += (self.sp - x[0]) ** 2
-            J += self.lam * (u ** 2) * 0.001
-            if J < best_J:
-                best_J, best_u = J, u
-        # avanza el estado interno un paso con la acción elegida
-        self._x = self._predict(self._x, best_u, dt)
-        return best_u
+        vel = 0.0 if self._prev_y is None else (y - self._prev_y) / dt
+        self._prev_y = y
+        return self.ff * self.sp + self.k1 * (self.sp - y) - self.k2 * vel
+
+
+class SMC:
+    """
+    Control por modos deslizantes (Sliding Mode Control).
+
+    Superficie deslizante s = λ·e + ė, con e = sp - y.
+    Ley de control: u = u_eq + η·sat(s/φ), donde u_eq es la prealimentación
+    (control equivalente del modelo) y la saturación en la capa límite φ
+    reduce el castañeo (chattering) frente a la función signo pura.
+    """
+    def __init__(self, setpoint, lam, eta, phi, planta):
+        self.sp = setpoint
+        self.lam = lam
+        self.eta = eta
+        self.phi = max(phi, 1e-3)
+        K, wn = planta["K"], planta["wn"]
+        b = K * wn * wn
+        a0 = wn * wn
+        self.ueq = a0 / b if b != 0 else 0.0    # control equivalente por unidad de sp
+        self._prev_e = None
+
+    def step(self, y, dt):
+        e = self.sp - y
+        de = 0.0 if self._prev_e is None else (e - self._prev_e) / dt
+        self._prev_e = e
+        s = self.lam * e + de
+        sat = max(-1.0, min(1.0, s / self.phi))
+        return self.ueq * self.sp + self.eta * sat
 
 
 def build_controller(controlador_id, params, planta):
     p = params
     if controlador_id == "pid":
         return PID(p["setpoint"], p["kp"], p["ki"], p["kd"])
-    if controlador_id == "logica":
-        return OnOff(p["setpoint"], p["histeresis"], p["u_alta"], p["u_baja"])
     if controlador_id == "difusa":
         return Fuzzy(p["setpoint"], p["ke"], p["kde"], p["ku"])
-    if controlador_id == "predictiva":
-        return MPC(p["setpoint"], p["np"], p["nc"], p["lambda"], planta)
+    if controlador_id == "lqr":
+        return LQR(p["setpoint"], p["q_pos"], p["q_vel"], p["r"], planta)
+    if controlador_id == "smc":
+        return SMC(p["setpoint"], p["lambda"], p["eta"], p["phi"], planta)
     raise ValueError(f"Controlador desconocido: {controlador_id}")
